@@ -1,0 +1,721 @@
+# %% [markdown]
+# # QAFusion-MH + GAN-Q-Learning - COMPLETE FIXED VERSION
+
+# %% [markdown]
+# ## 1. Setup and Imports
+
+# %%
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from collections import deque
+import random
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set seeds for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(42)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# %% [markdown]
+# ## 2. Data Generator (Simplified)
+
+# %%
+class SimpleDataGenerator:
+    """Simplified data generator for testing."""
+
+    def __init__(self, n_samples=5000, window_size=50, n_views=3, view_dims=[4, 4, 4]):
+        self.n_samples = n_samples
+        self.window_size = window_size
+        self.n_views = n_views
+        self.view_dims = view_dims
+
+    def generate_data(self):
+        """Generate synthetic multi-view data."""
+        data = []
+        targets = []
+
+        for _ in range(self.n_samples - self.window_size):
+            window_views = {}
+            for v in range(self.n_views):
+                # Generate random time series
+                seq = np.random.randn(self.window_size, self.view_dims[v])
+                window_views[v] = seq.astype(np.float32)
+            data.append(window_views)
+
+            # Generate target (energy consumption)
+            target = np.random.randn(5)  # 5 horizons
+            targets.append(target.astype(np.float32))
+
+        return data, targets
+
+# %% [markdown]
+# ## 3. QAFusion-MH Model (Simplified and Fixed)
+
+# %%
+class SimpleEncoder(nn.Module):
+    """Simple encoder for each view."""
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        out, (h, _) = self.lstm(x)
+        return h[-1]  # (batch, hidden_dim)
+
+
+class QAFusionMH(nn.Module):
+    """Quality-Aware Multi-View Fusion Model."""
+
+    def __init__(self, n_views=3, view_dims=[4, 4, 4], hidden_dim=64, n_horizons=5):
+        super().__init__()
+        self.n_views = n_views
+        self.hidden_dim = hidden_dim
+        self.n_horizons = n_horizons
+
+        # Encoders for each view
+        self.encoders = nn.ModuleList([
+            SimpleEncoder(view_dims[v], hidden_dim) for v in range(n_views)
+        ])
+
+        # Quality estimators (simple)
+        self.quality_net = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim + 4, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
+            ) for _ in range(n_views)
+        ])
+
+        # Gating network for fusion
+        self.gating_net = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim + 1, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1)
+            ) for _ in range(n_views)
+        ])
+
+        # Forecasting head
+        self.forecast_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, n_horizons)
+        )
+
+    def compute_quality_features(self, x):
+        """Compute simple quality features."""
+        batch_size = x.shape[0]
+        # Missing ratio (simulated)
+        miss_ratio = torch.zeros(batch_size).to(x.device)
+        # Reconstruction residual
+        recon_residual = torch.rand(batch_size).to(x.device) * 0.1
+        # Outlier score
+        outlier_score = torch.rand(batch_size).to(x.device) * 0.1
+        # Alignment score
+        alignment = torch.ones(batch_size).to(x.device)
+
+        return torch.stack([miss_ratio, recon_residual, outlier_score, alignment], dim=1)
+
+    def forward(self, views, return_all=False):
+        """
+        Args:
+            views: list of tensors, each (batch, seq_len, dim_v)
+        """
+        batch_size = views[0].shape[0]
+
+        # Encode each view
+        embeddings = []
+        for v in range(self.n_views):
+            h = self.encoders[v](views[v])  # (batch, hidden_dim)
+            embeddings.append(h)
+
+        # Compute quality scores
+        quality_scores = []
+        for v in range(self.n_views):
+            quality_features = self.compute_quality_features(views[v])
+            concat = torch.cat([embeddings[v], quality_features], dim=-1)
+            q = self.quality_net[v](concat).squeeze(-1)
+            quality_scores.append(q)
+
+        # Compute gating weights
+        weights = []
+        logits = []
+        for v in range(self.n_views):
+            concat = torch.cat([embeddings[v], quality_scores[v].unsqueeze(-1)], dim=-1)
+            logit = self.gating_net[v](concat).squeeze(-1)
+            logits.append(logit)
+
+        # Softmax over views
+        logits_stack = torch.stack(logits, dim=1)  # (batch, n_views)
+        weights = torch.softmax(logits_stack, dim=1)  # (batch, n_views)
+
+        # Weighted fusion
+        fused_state = torch.zeros(batch_size, self.hidden_dim).to(views[0].device)
+        for v in range(self.n_views):
+            fused_state = fused_state + weights[:, v:v+1] * embeddings[v]
+
+        # Multi-horizon forecasting
+        predictions = self.forecast_head(fused_state)  # (batch, n_horizons)
+
+        if return_all:
+            return fused_state, predictions, weights, quality_scores
+        return fused_state, predictions
+
+# %% [markdown]
+# ## 4. Conditional GAN (Fixed)
+
+# %%
+class SimpleGAN(nn.Module):
+    """Simplified Conditional GAN."""
+
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # Generator: (state, action, noise) -> (reward, next_state)
+        gen_input = state_dim + action_dim + 16
+        self.generator = nn.Sequential(
+            nn.Linear(gen_input, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1 + state_dim)  # reward + next_state
+        )
+
+        # Discriminator: (state, action, reward, next_state) -> real/fake
+        disc_input = state_dim + action_dim + 1 + state_dim
+        self.discriminator = nn.Sequential(
+            nn.Linear(disc_input, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def encode_action(self, action, batch_size):
+        """Convert action indices to one-hot."""
+        action_onehot = torch.zeros(batch_size, self.action_dim).to(action.device)
+        action_onehot.scatter_(1, action.unsqueeze(-1), 1)
+        return action_onehot
+
+    def generate(self, state, action):
+        """Generate synthetic reward and next_state."""
+        batch_size = state.shape[0]
+        noise = torch.randn(batch_size, 16).to(state.device)
+        action_onehot = self.encode_action(action, batch_size)
+
+        concat = torch.cat([state, action_onehot, noise], dim=-1)
+        output = self.generator(concat)
+
+        reward = output[:, 0]  # (batch,)
+        next_state = output[:, 1:]  # (batch, state_dim)
+
+        return reward, next_state
+
+    def discriminate(self, state, action, reward, next_state):
+        """Discriminate real vs fake."""
+        batch_size = state.shape[0]
+        action_onehot = self.encode_action(action, batch_size)
+
+        concat = torch.cat([state, action_onehot, reward.unsqueeze(-1), next_state], dim=-1)
+        return self.discriminator(concat).squeeze(-1)
+
+# %% [markdown]
+# ## 5. Q-Learning Components
+
+# %%
+class ReplayBuffer:
+    """Simple replay buffer."""
+
+    def __init__(self, max_size=10000):
+        self.buffer = deque(maxlen=max_size)
+
+    def add(self, state, action, reward, next_state, is_synthetic=False, quality=1.0):
+        self.buffer.append({
+            'state': state.copy() if hasattr(state, 'copy') else state,
+            'action': action,
+            'reward': reward,
+            'next_state': next_state.copy() if hasattr(next_state, 'copy') else next_state,
+            'is_synthetic': is_synthetic,
+            'quality': quality
+        })
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
+
+        states = np.stack([b['state'] for b in batch])
+        actions = [b['action'] for b in batch]
+        rewards = [b['reward'] for b in batch]
+        next_states = np.stack([b['next_state'] for b in batch])
+        is_synthetic = [b['is_synthetic'] for b in batch]
+        qualities = [b['quality'] for b in batch]
+
+        return states, actions, rewards, next_states, is_synthetic, qualities
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class QLearningAgent:
+    """Simple Q-Learning Agent."""
+
+    def __init__(self, state_dim, action_dim, lr=0.1, gamma=0.95, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.lr = lr
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.q_table = {}
+
+    def _discretize(self, state):
+        """Discretize continuous state."""
+        if isinstance(state, np.ndarray):
+            # Use first 4 dimensions and quantize
+            state_key = tuple((state[:min(4, len(state))] * 20).astype(int))
+            return state_key
+        return (0,)
+
+    def get_q(self, state, action):
+        key = (self._discretize(state), action)
+        return self.q_table.get(key, 0.0)
+
+    def update(self, state, action, reward, next_state, weight=1.0):
+        """Update Q-value."""
+        state_key = self._discretize(state)
+        next_state_key = self._discretize(next_state)
+
+        current_q = self.q_table.get((state_key, action), 0.0)
+        next_q = max([self.q_table.get((next_state_key, a), 0.0) for a in range(self.action_dim)])
+        target = reward + self.gamma * next_q
+
+        new_q = current_q + weight * self.lr * (target - current_q)
+        self.q_table[(state_key, action)] = new_q
+
+        return new_q
+
+    def select_action(self, state, greedy=False):
+        """Select action using epsilon-greedy."""
+        if not greedy and np.random.random() < self.epsilon:
+            return np.random.randint(self.action_dim)
+
+        state_key = self._discretize(state)
+        q_values = [self.q_table.get((state_key, a), 0.0) for a in range(self.action_dim)]
+        return np.argmax(q_values)
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+# %% [markdown]
+# ## 6. Environment
+
+# %%
+class EnergyEnvironment:
+    """Simple WSN Energy Environment."""
+
+    def __init__(self, max_steps=100):
+        self.max_steps = max_steps
+        self.state_dim = 4
+        self.action_dim = 4  # 0: sleep, 1: sense, 2: tx, 3: harvest
+
+        self.reset()
+
+    def reset(self):
+        self.step_count = 0
+        self.battery = 1.0
+        self.queue = 0
+        self.pdr = 1.0
+        return self._get_state()
+
+    def _get_state(self):
+        return np.array([self.battery, self.queue / 10.0, self.pdr, self.step_count / self.max_steps], dtype=np.float32)
+
+    def step(self, action):
+        # Energy consumption
+        energy_map = {0: 0.01, 1: 0.05, 2: 0.15, 3: -0.05}
+        energy_used = energy_map.get(action, 0.05)
+
+        self.battery = max(0, self.battery - energy_used)
+        self.battery = min(1, self.battery)
+
+        # Dynamics
+        if action == 2:  # transmit
+            self.queue = max(0, self.queue - 1)
+            self.pdr = min(1, self.pdr + 0.05)
+        else:
+            self.queue = min(10, self.queue + 0.5)
+            self.pdr = max(0, self.pdr - 0.02)
+
+        if action == 3:  # harvest
+            self.battery = min(1, self.battery + 0.1)
+
+        # Reward
+        reward = -energy_used + 0.5 * self.pdr - 0.1 * (self.queue / 10.0)
+        if self.battery < 0.1:
+            reward -= 5.0
+
+        self.step_count += 1
+        done = self.step_count >= self.max_steps or self.battery <= 0
+
+        return self._get_state(), reward, done
+
+# %% [markdown]
+# ## 7. Main Training Pipeline
+
+# %%
+class Trainer:
+    """Main training pipeline."""
+
+    def __init__(self, state_dim=4, action_dim=4, hidden_dim=64, n_views=3, view_dims=[4, 4, 4]):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+
+        # Initialize models
+        self.qafusion = QAFusionMH(n_views, view_dims, hidden_dim, n_horizons=5).to(device)
+        self.gan = SimpleGAN(state_dim, action_dim, hidden_dim=64).to(device)
+        self.agent = QLearningAgent(state_dim, action_dim, lr=0.1, gamma=0.95)
+
+        self.replay_buffer = ReplayBuffer(max_size=10000)
+        self.qafusion_optimizer = optim.Adam(self.qafusion.parameters(), lr=0.001)
+        self.gan_optimizer_g = optim.Adam(self.gan.generator.parameters(), lr=0.001)
+        self.gan_optimizer_d = optim.Adam(self.gan.discriminator.parameters(), lr=0.001)
+
+        self.metrics = {'returns': [], 'losses': []}
+
+    def train_qafusion(self, data, targets, epochs=20, batch_size=32):
+        """Train QAFusion-MH."""
+        print("=" * 50)
+        print("Training QAFusion-MH...")
+        print("=" * 50)
+
+        n_samples = len(data)
+
+        for epoch in range(epochs):
+            total_loss = 0
+            n_batches = 0
+
+            for i in range(0, n_samples - batch_size, batch_size):
+                batch_views = [[] for _ in range(len(self.qafusion.encoders))]
+                batch_targets = []
+
+                for j in range(batch_size):
+                    idx = (i + j) % n_samples
+                    views = data[idx]
+                    for v in range(len(views)):
+                        batch_views[v].append(views[v])
+                    batch_targets.append(targets[idx])
+
+                # Convert to tensors
+                for v in range(len(batch_views)):
+                    batch_views[v] = torch.tensor(np.stack(batch_views[v]), dtype=torch.float32).to(device)
+                batch_targets = torch.tensor(np.stack(batch_targets), dtype=torch.float32).to(device)
+
+                # Forward
+                _, predictions = self.qafusion(batch_views)
+
+                # Loss
+                loss = nn.MSELoss()(predictions, batch_targets)
+
+                # Backward
+                self.qafusion_optimizer.zero_grad()
+                loss.backward()
+                self.qafusion_optimizer.step()
+
+                total_loss += loss.item()
+                n_batches += 1
+
+            avg_loss = total_loss / max(n_batches, 1)
+            if (epoch + 1) % 5 == 0:
+                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+
+        print("QAFusion-MH training complete!")
+
+    def collect_transitions(self, env, n_episodes=20):
+        """Collect real transitions."""
+        print("\n" + "=" * 50)
+        print("Collecting Real Transitions...")
+        print("=" * 50)
+
+        transitions = []
+
+        for episode in range(n_episodes):
+            state = env.reset()
+            episode_return = 0
+
+            for _ in range(env.max_steps):
+                action = self.agent.select_action(state)
+                next_state, reward, done = env.step(action)
+
+                transitions.append((state.copy(), action, reward, next_state.copy()))
+                self.replay_buffer.add(state, action, reward, next_state, is_synthetic=False)
+
+                self.agent.update(state, action, reward, next_state)
+                episode_return += reward
+                state = next_state
+
+                if done:
+                    break
+
+            self.agent.decay_epsilon()
+            self.metrics['returns'].append(episode_return)
+
+            if (episode + 1) % 5 == 0:
+                print(f"Episode {episode+1}/{n_episodes}, Return: {episode_return:.2f}, Epsilon: {self.agent.epsilon:.3f}")
+
+        print(f"Collected {len(transitions)} transitions")
+        return transitions
+
+    def train_gan(self, transitions, epochs=30, batch_size=32):
+        """Train GAN on real transitions."""
+        print("\n" + "=" * 50)
+        print("Training GAN...")
+        print("=" * 50)
+
+        if len(transitions) < batch_size:
+            print(f"Warning: Only {len(transitions)} transitions, need at least {batch_size}")
+            return
+
+        for epoch in range(epochs):
+            # Sample batch
+            batch = random.sample(transitions, min(batch_size, len(transitions)))
+            states = torch.tensor(np.stack([b[0] for b in batch]), dtype=torch.float32).to(device)
+            actions = torch.tensor([b[1] for b in batch], dtype=torch.long).to(device)
+            rewards = torch.tensor([b[2] for b in batch], dtype=torch.float32).to(device)
+            next_states = torch.tensor(np.stack([b[3] for b in batch]), dtype=torch.float32).to(device)
+
+            # Train discriminator
+            for _ in range(2):  # Critic updates
+                real_out = self.gan.discriminate(states, actions, rewards, next_states)
+                d_real_loss = -torch.log(real_out + 1e-8).mean()
+
+                fake_reward, fake_next_state = self.gan.generate(states, actions)
+                fake_out = self.gan.discriminate(states, actions, fake_reward.detach(), fake_next_state.detach())
+                d_fake_loss = -torch.log(1 - fake_out + 1e-8).mean()
+
+                d_loss = d_real_loss + d_fake_loss
+
+                self.gan_optimizer_d.zero_grad()
+                d_loss.backward()
+                self.gan_optimizer_d.step()
+
+            # Train generator
+            fake_reward, fake_next_state = self.gan.generate(states, actions)
+            fake_out = self.gan.discriminate(states, actions, fake_reward, fake_next_state)
+            g_loss = -torch.log(fake_out + 1e-8).mean()
+
+            self.gan_optimizer_g.zero_grad()
+            g_loss.backward()
+            self.gan_optimizer_g.step()
+
+            if (epoch + 1) % 10 == 0:
+                print(f"GAN Epoch {epoch+1}/{epochs}, G Loss: {g_loss.item():.4f}, D Loss: {d_loss.item():.4f}")
+
+        print("GAN training complete!")
+
+    def generate_synthetic(self, n_samples=500, quality_threshold=0.6):
+        """Generate synthetic transitions with quality control."""
+        synthetic_added = 0
+
+        for _ in range(n_samples):
+            if len(self.replay_buffer.buffer) > 0:
+                sample = random.choice(list(self.replay_buffer.buffer))
+                state = torch.tensor(sample['state'], dtype=torch.float32).to(device)
+                action = sample['action']
+                action_tensor = torch.tensor([action]).to(device)
+
+                with torch.no_grad():
+                    state_batch = state.unsqueeze(0)
+                    fake_reward, fake_next_state = self.gan.generate(state_batch, action_tensor)
+
+                    # Quality score from discriminator
+                    quality = self.gan.discriminate(state_batch, action_tensor, fake_reward, fake_next_state).item()
+
+                    if quality > quality_threshold:
+                        self.replay_buffer.add(
+                            state.cpu().numpy(),
+                            action,
+                            fake_reward.item(),
+                            fake_next_state.cpu().numpy().squeeze(),
+                            is_synthetic=True,
+                            quality=quality
+                        )
+                        synthetic_added += 1
+
+        print(f"Added {synthetic_added}/{n_samples} synthetic transitions (quality > {quality_threshold})")
+        return synthetic_added
+
+    def train_policy(self, env, n_episodes=100, synthetic_interval=10, synthetic_count=300):
+        """Train policy with quality-controlled replay."""
+        print("\n" + "=" * 50)
+        print("Training Policy with Quality-Controlled Replay...")
+        print("=" * 50)
+
+        for episode in range(n_episodes):
+            # Generate synthetic periodically
+            if episode > 0 and episode % synthetic_interval == 0:
+                self.generate_synthetic(n_samples=synthetic_count, quality_threshold=0.6)
+
+            state = env.reset()
+            episode_return = 0
+
+            for _ in range(env.max_steps):
+                action = self.agent.select_action(state)
+                next_state, reward, done = env.step(action)
+
+                # Add to buffer
+                self.replay_buffer.add(state, action, reward, next_state, is_synthetic=False)
+
+                # Update from mixed batch
+                if len(self.replay_buffer) > 32:
+                    states, actions, rewards, next_states, is_synthetic, qualities = self.replay_buffer.sample(32)
+
+                    for i in range(len(states)):
+                        weight = 1.0 if not is_synthetic[i] else qualities[i]
+                        self.agent.update(states[i], actions[i], rewards[i], next_states[i], weight=weight)
+                else:
+                    self.agent.update(state, action, reward, next_state)
+
+                episode_return += reward
+                state = next_state
+
+                if done:
+                    break
+
+            self.agent.decay_epsilon()
+            self.metrics['returns'].append(episode_return)
+
+            if (episode + 1) % 20 == 0:
+                avg_return = np.mean(self.metrics['returns'][-20:]) if len(self.metrics['returns']) >= 20 else episode_return
+                print(f"Episode {episode+1}/{n_episodes}, Return: {avg_return:.2f}, Buffer: {len(self.replay_buffer)}")
+
+        print("Policy training complete!")
+
+    def evaluate(self, env, n_episodes=20):
+        """Evaluate policy."""
+        print("\n" + "=" * 50)
+        print("Evaluating Policy...")
+        print("=" * 50)
+
+        returns = []
+
+        for episode in range(n_episodes):
+            state = env.reset()
+            episode_return = 0
+            step_count = 0
+
+            for _ in range(env.max_steps):
+                action = self.agent.select_action(state, greedy=True)
+                next_state, reward, done = env.step(action)
+                episode_return += reward
+                step_count += 1
+                state = next_state
+
+                if done:
+                    break
+
+            returns.append(episode_return)
+
+        avg_return = np.mean(returns)
+        std_return = np.std(returns)
+        print(f"Average Return: {avg_return:.2f} ± {std_return:.2f}")
+
+        return returns
+
+# %% [markdown]
+# ## 8. Run Complete Experiment
+
+# %%
+def run_experiment():
+    """Run the complete experiment."""
+    print("=" * 70)
+    print("QAFusion-MH + GAN-Q-Learning - Complete Experiment")
+    print("=" * 70)
+
+    # 1. Generate data
+    print("\n[1] Generating training data...")
+    data_gen = SimpleDataGenerator(n_samples=2000, window_size=30, n_views=3, view_dims=[4, 4, 4])
+    train_data, train_targets = data_gen.generate_data()
+    print(f"Generated {len(train_data)} training samples")
+
+    # 2. Initialize trainer
+    print("\n[2] Initializing models...")
+    trainer = Trainer(state_dim=4, action_dim=4, hidden_dim=32, n_views=3, view_dims=[4, 4, 4])
+
+    # 3. Train QAFusion-MH
+    trainer.train_qafusion(train_data, train_targets, epochs=15, batch_size=16)
+
+    # 4. Initialize environment and collect transitions
+    print("\n[3] Collecting real transitions...")
+    env = EnergyEnvironment(max_steps=50)
+    transitions = trainer.collect_transitions(env, n_episodes=15)
+
+    # 5. Train GAN
+    trainer.train_gan(transitions, epochs=20, batch_size=16)
+
+    # 6. Train policy with quality-controlled replay
+    trainer.train_policy(env, n_episodes=60, synthetic_interval=10, synthetic_count=200)
+
+    # 7. Evaluate
+    eval_returns = trainer.evaluate(env, n_episodes=15)
+
+    # 8. Plot results
+    print("\n[4] Plotting results...")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    axes[0].plot(trainer.metrics['returns'])
+    axes[0].set_xlabel('Episode')
+    axes[0].set_ylabel('Return')
+    axes[0].set_title('Training Returns')
+    axes[0].grid(True, alpha=0.3)
+
+    if len(trainer.metrics['returns']) > 10:
+        running_avg = pd.Series(trainer.metrics['returns']).rolling(10).mean()
+        axes[1].plot(running_avg)
+        axes[1].set_xlabel('Episode')
+        axes[1].set_ylabel('Return (10-ep avg)')
+        axes[1].set_title('Running Average Return')
+        axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('experiment_results.png', dpi=150)
+    plt.show()
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("EXPERIMENT SUMMARY")
+    print("=" * 70)
+    print(f"Total episodes: {len(trainer.metrics['returns'])}")
+    print(f"Best return: {max(trainer.metrics['returns']):.2f}")
+    if len(trainer.metrics['returns']) >= 20:
+        print(f"Final average return (last 20): {np.mean(trainer.metrics['returns'][-20:]):.2f}")
+    print(f"Evaluation average: {np.mean(eval_returns):.2f} ± {np.std(eval_returns):.2f}")
+    print(f"Final buffer size: {len(trainer.replay_buffer)}")
+    print(f"Final epsilon: {trainer.agent.epsilon:.3f}")
+
+    print("\n✅ Experiment completed successfully!")
+
+    return trainer, eval_returns
+
+
+# Run the experiment
+if __name__ == "__main__":
+    trainer, eval_returns = run_experiment()
